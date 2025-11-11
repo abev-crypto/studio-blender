@@ -13,6 +13,7 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    FloatVectorProperty,
     IntProperty,
     StringProperty,
 )
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 
 __all__ = (
     "ScheduleOverride",
+    "StoryboardSplitAllocation",
     "StoryboardEntry",
     "StoryboardEntryOrTransition",
     "Storyboard",
@@ -95,6 +97,36 @@ class ScheduleOverride(PropertyGroup):
         return " | ".join(parts)
 
 
+class StoryboardSplitAllocation(PropertyGroup):
+    """Blender property group describing a single split branch allocation."""
+
+    name = StringProperty(
+        name="Storyboard",
+        description="Display name of the split storyboard",
+        default="",
+    )
+
+    branch_id = IntProperty(
+        name="Branch ID",
+        description="Identifier of the storyboard branch controlled by this split",
+        min=1,
+        default=1,
+    )
+
+    num_drones = IntProperty(
+        name="Drones",
+        description="Number of drones assigned to this split storyboard",
+        min=0,
+        default=0,
+    )
+
+    def ensure_default_name(self, index: int) -> None:
+        if not self.name:
+            self.name = f"Storyboard {index + 1}"
+        if self.branch_id <= 0:
+            self.branch_id = index + 1
+
+
 def _handle_formation_change(self: StoryboardEntry, context: Optional[Context] = None):
     if not self.is_name_customized:
         self.name = self.formation.name if self.formation else ""
@@ -135,6 +167,8 @@ class StoryboardEntryPurpose(_StoryboardEntryPurposeMixin, enum.Enum):
     UNSPECIFIED = "Unspecified", 0
     TAKEOFF = "Takeoff", 1
     SHOW = "Show", 2
+    SPLIT = "Split", 2
+    MERGE = "Merge", 2
     LANDING = "Landing", 3
 
     @property
@@ -227,6 +261,8 @@ class StoryboardEntry(PropertyGroup):
             StoryboardEntryPurpose.UNSPECIFIED.bpy_enum_item,
             StoryboardEntryPurpose.TAKEOFF.bpy_enum_item,
             StoryboardEntryPurpose.SHOW.bpy_enum_item,
+            StoryboardEntryPurpose.SPLIT.bpy_enum_item,
+            StoryboardEntryPurpose.MERGE.bpy_enum_item,
             StoryboardEntryPurpose.LANDING.bpy_enum_item,
         ],
         name="Purpose",
@@ -237,6 +273,53 @@ class StoryboardEntry(PropertyGroup):
         ),
         default=StoryboardEntryPurpose.UNSPECIFIED.name,
     )
+
+    split_id = IntProperty(
+        name="Split ID",
+        description="Identifier of the split branch this entry belongs to",
+        default=0,
+        min=0,
+        options=set(),
+    )
+    split_color = FloatVectorProperty(
+        name="Split Color",
+        description="Display color associated with the split branch",
+        subtype="COLOR",
+        default=(0.5, 0.5, 0.5),
+        min=0.0,
+        max=1.0,
+    )
+    split_count = IntProperty(
+        name="Split Count",
+        description="Number of parallel storyboards to activate when this entry is a split",
+        min=1,
+        default=1,
+        update=lambda self, context: self._ensure_split_allocations(),
+    )
+    split_allocations: bpy_prop_collection[StoryboardSplitAllocation] = CollectionProperty(
+        type=StoryboardSplitAllocation
+    )
+    active_split_allocation_index = IntProperty(
+        name="Active split allocation index",
+        description="Index of the split allocation currently selected for editing",
+        default=0,
+    )
+
+    def _ensure_split_allocations(self) -> None:
+        """Ensures that the number of split allocations matches the configured split count."""
+
+        count = max(int(self.split_count), 0)
+        while len(self.split_allocations) < count:
+            allocation = self.split_allocations.add()
+            allocation.ensure_default_name(len(self.split_allocations) - 1)
+        while len(self.split_allocations) > count:
+            self.split_allocations.remove(len(self.split_allocations) - 1)
+
+        for index, allocation in enumerate(self.split_allocations):
+            allocation.ensure_default_name(index)
+
+        if self.active_split_allocation_index >= len(self.split_allocations):
+            self.active_split_allocation_index = max(0, len(self.split_allocations) - 1)
 
     pre_delay_per_drone_in_frames = FloatProperty(
         name="Departure delay",
@@ -551,6 +634,7 @@ class Storyboard(PropertyGroup, ListMixin):
         entry.duration = duration
         entry.name = name
         entry.purpose = purpose.name
+        entry._ensure_split_allocations()
 
         if (
             formation is None
@@ -890,33 +974,40 @@ class Storyboard(PropertyGroup, ListMixin):
             StoryboardValidationError: If validation fails.
         """
         current_purpose = StoryboardEntryPurpose.UNSPECIFIED
-        for index, (entry, next_entry) in enumerate(
-            zip(sorted_entries, sorted_entries[1:])
-        ):
-            # -- No overlap.
-            if entry.frame_end >= next_entry.frame_start:
-                raise StoryboardValidationError(
-                    f"Storyboard entry {entry.name!r} at index {index + 1} and "
-                    f"frame {next_entry.frame_start} overlaps with next entry "
-                    f"{next_entry.name!r}"
-                )
+        split_stack: list[StoryboardEntry] = []
+        for index, entry in enumerate(sorted_entries):
+            if index + 1 < len(sorted_entries):
+                next_entry = sorted_entries[index + 1]
+                if entry.frame_end >= next_entry.frame_start:
+                    raise StoryboardValidationError(
+                        f"Storyboard entry {entry.name!r} at index {index + 1} and "
+                        f"frame {next_entry.frame_start} overlaps with next entry "
+                        f"{next_entry.name!r}"
+                    )
 
-            # -- Purposes are in the correct order.
-            entry_purpose, next_purpose = (
-                StoryboardEntryPurpose[entry.purpose],
-                StoryboardEntryPurpose[next_entry.purpose],
-            )
-            if entry_purpose != StoryboardEntryPurpose.UNSPECIFIED:
+            entry_purpose = StoryboardEntryPurpose[entry.purpose]
+            if entry_purpose == StoryboardEntryPurpose.SPLIT:
+                split_stack.append(entry)
+            elif entry_purpose == StoryboardEntryPurpose.MERGE:
+                if not split_stack:
+                    raise StoryboardValidationError(
+                        f"Storyboard entry {entry.name!r} with purpose 'Merge' has no matching split"
+                    )
+                split_stack.pop()
+            elif entry_purpose != StoryboardEntryPurpose.UNSPECIFIED:
+                if entry_purpose.order < current_purpose.order:
+                    raise StoryboardValidationError(
+                        f"Storyboard entry #{index + 1} has purpose "
+                        f"{entry_purpose.ui_name!r} that cannot be after "
+                        f"previous entry with purpose {current_purpose.ui_name!r}"
+                    )
                 current_purpose = entry_purpose
-            if (
-                next_purpose != StoryboardEntryPurpose.UNSPECIFIED
-                and next_purpose.order < current_purpose.order
-            ):
-                raise StoryboardValidationError(
-                    f"Storyboard entry #{index + 1} has purpose "
-                    f"{next_purpose.ui_name!r} that cannot be after "
-                    f"previous entry with purpose {current_purpose.ui_name!r}"
-                )
+
+        if split_stack:
+            first_unmatched = split_stack[-1]
+            raise StoryboardValidationError(
+                f"Storyboard entry {first_unmatched.name!r} with purpose 'Split' has no matching merge"
+            )
 
     def _validate_formation_size_contraints(
         self, sorted_entries: list[StoryboardEntry]

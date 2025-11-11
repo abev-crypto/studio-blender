@@ -2,7 +2,7 @@ from bpy.types import Panel
 
 from typing import Optional
 
-from sbstudio.plugin.model.storyboard import Storyboard
+from sbstudio.plugin.model.storyboard import Storyboard, StoryboardEntryPurpose
 from sbstudio.plugin.operators import (
     CreateNewStoryboardEntryOperator,
     MoveStoryboardEntryDownOperator,
@@ -44,7 +44,7 @@ class StoryboardEditor(Panel):
 
         col = row.column()
         col.template_list(
-            "UI_UL_list",
+            "SKYBRUSH_UL_storyboard_entries",
             "OBJECT_PT_skybrush_storyboard_editor",
             storyboard,
             "entries",
@@ -93,6 +93,20 @@ class StoryboardEditor(Panel):
                 text="",
             )
             col.prop(entry, "purpose")
+            col.prop(entry, "split_id")
+            col.prop(entry, "split_color", text="Split Color")
+
+            if StoryboardEntryPurpose[entry.purpose] == StoryboardEntryPurpose.SPLIT:
+                entry._ensure_split_allocations()
+                split_box = col.box()
+                split_box.label(text="Split Configuration")
+                split_box.prop(entry, "split_count")
+                for index, allocation in enumerate(entry.split_allocations):
+                    row = split_box.row(align=True)
+                    row.prop(allocation, "name", text="")
+                    row.prop(allocation, "branch_id", text="ID")
+                    row.prop(allocation, "num_drones")
+
             col.prop(entry, "is_name_customized")
             col.popover(
                 "OBJECT_PT_skybrush_transition_editor_pre",
