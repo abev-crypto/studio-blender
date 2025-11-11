@@ -46,6 +46,7 @@ from sbstudio.i18n.translations import translations_dict
 from sbstudio.plugin.lists import (
     SKYBRUSH_UL_lightfxlist,
     SKYBRUSH_UL_scheduleoverridelist,
+    SKYBRUSH_UL_storyboard_entries,
 )
 from sbstudio.plugin.menus import GenerateMarkersMenu
 from sbstudio.plugin.model import (
@@ -261,7 +262,11 @@ operators = (
 )
 
 #: List widgets in this addon.
-lists = (SKYBRUSH_UL_lightfxlist, SKYBRUSH_UL_scheduleoverridelist)
+lists = (
+    SKYBRUSH_UL_lightfxlist,
+    SKYBRUSH_UL_scheduleoverridelist,
+    SKYBRUSH_UL_storyboard_entries,
+)
 
 #: Menus in this addon
 menus = (GenerateMarkersMenu,)

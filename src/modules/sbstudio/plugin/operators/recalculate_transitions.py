@@ -23,7 +23,11 @@ from sbstudio.plugin.model.formation import (
     get_markers_and_related_objects_from_formation,
     get_world_coordinates_of_markers_from_formation,
 )
-from sbstudio.plugin.model.storyboard import Storyboard, StoryboardEntry
+from sbstudio.plugin.model.storyboard import (
+    Storyboard,
+    StoryboardEntry,
+    StoryboardEntryPurpose,
+)
 from sbstudio.plugin.tasks.safety_check import invalidate_caches
 from sbstudio.plugin.utils import create_internal_id
 from sbstudio.plugin.utils.evaluator import create_position_evaluator
@@ -699,69 +703,108 @@ def update_transition_for_storyboard_entry(
     return mapping
 
 
+@dataclass(frozen=True)
+class SplitAllocationDescriptor:
+    """Descriptor that captures split configuration for a branch."""
+
+    branch_id: int
+    num_drones: int
+
+
+@dataclass(frozen=True)
+class SplitAllocationRuntime:
+    """Runtime descriptor of a split allocation with positional metadata."""
+
+    branch_id: int
+    count: int
+
+
+@dataclass
+class BranchState:
+    """Runtime state of a storyboard branch during recalculation."""
+
+    branch_id: int
+    drones: List[Object]
+    previous_entry: Optional[StoryboardEntry] = None
+    previous_mapping: Optional[Mapping] = None
+
+
+@dataclass
+class SplitContext:
+    """Represents an active split that must be merged later."""
+
+    parent_state: BranchState
+    allocations: Tuple[SplitAllocationRuntime, ...]
+
+
 @dataclass
 class RecalculationTask:
     """Descriptor for a single transition recalculation task to perform."""
 
     entry: StoryboardEntry
-    """The _target_ entry of the transition to recalculate."""
-
     entry_index: int
-    """Index of the target entry of the transition."""
-
+    branch_id: int = 0
+    should_recalculate: bool = True
+    is_split: bool = False
+    is_merge: bool = False
+    split_branches: Tuple[SplitAllocationDescriptor, ...] = ()
     previous_entry: Optional[StoryboardEntry] = None
-    """The entry that precedes the target entry in the storyboard; `None` if the
-    target entry is the first one.
-    """
-
     start_frame_of_next_entry: Optional[int] = None
-    """The start frame of the _next_ entry in the storyboard; `None` if the
-    target entry is the last one.
-    """
-
-    @classmethod
-    def for_entry_by_index(cls, entries: Sequence[StoryboardEntry], index: int):
-        return cls(
-            entries[index],
-            index,
-            entries[index - 1] if index > 0 else None,
-            entries[index + 1].frame_start if index + 1 < len(entries) else None,
-        )
+    previous_mapping: Optional[Mapping] = None
+    drones: Sequence[Object] = ()
 
 
 def recalculate_transitions(
-    tasks: Iterable[RecalculationTask], *, start_of_scene: int
+    tasks: Iterable[RecalculationTask], *, start_of_scene: int, drones: Sequence[Object]
 ) -> None:
-    drones = Collections.find_drones().objects
-    if not drones:
+    drone_list = list(drones)
+    if not drone_list:
         return
 
-    # Mapping from drone indices to marker indices in the previous
-    # formation, or ``None`` if this is not known for some reason. Possible
-    # reasons are:
-    #
-    # - this is the first formation that we are calculating
-    # - the transition of the previous storyboard entry was locked so we
-    #   don't have the mapping now
-    previous_mapping: Optional[Mapping] = None
+    branch_states: dict[int, BranchState] = {
+        0: BranchState(branch_id=0, drones=list(drone_list))
+    }
+    split_stack: List[SplitContext] = []
 
     with create_position_evaluator() as get_positions_of:
-        # Iterate through the entries for which we need to recalculate the
-        # transitions
         for task in tasks:
-            previous_mapping = update_transition_for_storyboard_entry(
-                task.entry,
-                task.entry_index,
-                drones,
-                get_positions_of=get_positions_of,
-                previous_entry=task.previous_entry,
-                previous_mapping=previous_mapping,
-                start_of_scene=start_of_scene,
-                start_of_next=task.start_frame_of_next_entry,
-            )
+            state = _select_branch_state(task, branch_states, split_stack, drone_list)
 
-    # Remove F-curves with data paths that refer to nonexistent constraints
-    for drone in drones:
+            task.previous_entry = state.previous_entry
+            task.previous_mapping = state.previous_mapping
+            task.drones = list(state.drones)
+
+            mapping: Optional[Mapping] = None
+            if task.should_recalculate and task.entry.formation:
+                mapping = update_transition_for_storyboard_entry(
+                    task.entry,
+                    task.entry_index,
+                    task.drones,
+                    get_positions_of=get_positions_of,
+                    previous_entry=task.previous_entry,
+                    previous_mapping=task.previous_mapping,
+                    start_of_scene=start_of_scene,
+                    start_of_next=task.start_frame_of_next_entry,
+                )
+            elif task.entry.formation:
+                mapping = _normalize_mapping(task.entry.get_mapping())
+
+            state.previous_mapping = list(mapping) if mapping is not None else None
+            if task.entry.formation:
+                state.previous_entry = task.entry
+
+            if task.is_split:
+                if task.split_branches:
+                    split_stack.append(
+                        _apply_split_to_state(state, task, branch_states)
+                    )
+                else:
+                    raise SkybrushStudioError(
+                        f"Split entry {task.entry.name!r} has no branch allocations configured"
+                    )
+            # Merge handling is performed inside _select_branch_state
+
+    for drone in drone_list:
         try:
             cleanup_actions_for_object(drone)
         except Exception:
@@ -769,6 +812,121 @@ def recalculate_transitions(
 
     bpy.ops.skybrush.fix_constraint_ordering()
     invalidate_caches(clear_result=True)
+
+
+def _select_branch_state(
+    task: RecalculationTask,
+    branch_states: dict[int, BranchState],
+    split_stack: List[SplitContext],
+    drones: Sequence[Object],
+) -> BranchState:
+    if task.is_merge:
+        return _restore_parent_state(split_stack, branch_states, drones)
+
+    state = branch_states.get(task.branch_id)
+    if state is None:
+        state = BranchState(branch_id=task.branch_id, drones=list(drones))
+        branch_states[task.branch_id] = state
+    return state
+
+
+def _apply_split_to_state(
+    parent_state: BranchState,
+    task: RecalculationTask,
+    branch_states: dict[int, BranchState],
+) -> SplitContext:
+    total_requested = sum(max(0, int(descriptor.num_drones)) for descriptor in task.split_branches)
+    total_available = len(parent_state.drones)
+    if total_requested != total_available:
+        raise SkybrushStudioError(
+            f"Split entry {task.entry.name!r} requests {total_requested} drones "
+            f"but branch #{parent_state.branch_id} provides {total_available}"
+        )
+
+    mapping = parent_state.previous_mapping
+    allocations: list[SplitAllocationRuntime] = []
+    offset = 0
+    seen: set[int] = set()
+    for descriptor in task.split_branches:
+        branch_id = int(descriptor.branch_id)
+        if branch_id in seen:
+            raise SkybrushStudioError(
+                f"Split entry {task.entry.name!r} defines branch id {branch_id} multiple times"
+            )
+        seen.add(branch_id)
+
+        count = max(0, int(descriptor.num_drones))
+        subset_drones = parent_state.drones[offset : offset + count]
+        subset_mapping = None
+        if mapping is not None:
+            subset_mapping = list(mapping[offset : offset + count])
+
+        child_state = BranchState(
+            branch_id=branch_id,
+            drones=subset_drones,
+            previous_entry=parent_state.previous_entry,
+            previous_mapping=subset_mapping,
+        )
+        branch_states[branch_id] = child_state
+        allocations.append(SplitAllocationRuntime(branch_id=branch_id, count=count))
+        offset += count
+
+    branch_states.pop(parent_state.branch_id, None)
+    return SplitContext(parent_state=parent_state, allocations=tuple(allocations))
+
+
+def _restore_parent_state(
+    split_stack: List[SplitContext],
+    branch_states: dict[int, BranchState],
+    drones: Sequence[Object],
+) -> BranchState:
+    if not split_stack:
+        state = branch_states.get(0)
+        if state is None:
+            state = BranchState(branch_id=0, drones=list(drones))
+            branch_states[0] = state
+        return state
+
+    context = split_stack.pop()
+    parent_state = context.parent_state
+    merged_mapping: Optional[List[Optional[int]]] = []
+    mapping_valid = True
+    last_entry: Optional[StoryboardEntry] = parent_state.previous_entry
+
+    for allocation in context.allocations:
+        child_state = branch_states.pop(allocation.branch_id, None)
+        if child_state is None:
+            mapping_valid = False
+            continue
+
+        if mapping_valid:
+            child_mapping = child_state.previous_mapping
+            if child_mapping is None or len(child_mapping) != allocation.count:
+                mapping_valid = False
+            else:
+                merged_mapping.extend(child_mapping)
+
+        if child_state.previous_entry is not None:
+            last_entry = child_state.previous_entry
+
+    parent_state.previous_mapping = merged_mapping if mapping_valid else None
+    parent_state.previous_entry = last_entry
+    branch_states[parent_state.branch_id] = parent_state
+    return parent_state
+
+
+def _normalize_mapping(mapping: Optional[Mapping]) -> Optional[Mapping]:
+    if not mapping:
+        return None
+
+    normalized: List[Optional[int]] = []
+    for value in mapping:
+        if value is None:
+            normalized.append(None)
+        else:
+            ivalue = int(value)
+            normalized.append(None if ivalue < 0 else ivalue)
+    return normalized
 
 
 class RecalculateTransitionsOperator(StoryboardOperator):
@@ -826,28 +984,20 @@ class RecalculateTransitionsOperator(StoryboardOperator):
             self.report({"ERROR"}, "You need to create some drones first")
             return {"CANCELLED"}
 
-        # Prepare a list consisting of triplets like this:
-        # end of previous formation, formation, start of next formation
         tasks = self._get_transitions_to_process(storyboard, entries)
-        if not tasks:
-            self.report({"ERROR"}, "No transitions match the selected scope")
+        if not any(task.should_recalculate for task in tasks):
+            self.report({"INFO"}, "No transitions match the selected scope")
             return {"CANCELLED"}
 
-        # Grab some common constants that we will need
         start_of_scene = min(context.scene.frame_start, storyboard.frame_start)
-
-        # Exclude locked transitions; see if there are any tasks remaining
-        tasks = [task for task in tasks if not task.entry.is_locked]
-        if not tasks:
-            self.report(
-                {"INFO"},
-                "All transitions in the selected scope are locked; nothing to do.",
-            )
-            return {"CANCELLED"}
 
         try:
             with call_api_from_blender_operator(self, "transition planner"):
-                recalculate_transitions(tasks, start_of_scene=start_of_scene)
+                recalculate_transitions(
+                    tasks,
+                    start_of_scene=start_of_scene,
+                    drones=drones,
+                )
             success = True
         except Exception:
             success = False
@@ -857,18 +1007,8 @@ class RecalculateTransitionsOperator(StoryboardOperator):
     def _get_transitions_to_process(
         self, storyboard: Storyboard, entries: Sequence[StoryboardEntry]
     ) -> List[RecalculationTask]:
-        """Processes the storyboard entries and selects the ones for which we
-        need to recalculate the transitions, based on the scope parameter of
-        the operator.
+        """Collects recalculation tasks together with branch metadata."""
 
-        Returns:
-            for each entry where the transition _to_ the formation of the entry
-            has to be recalculated, a tuple containing the previous storyboard
-            entry (`None` if this is the first formation in the entire
-            storyboard), the current storyboard entry, and the start frame of
-            the next formation (`None` if this is the last formation in the
-            entire storyboard)
-        """
         tasks: List[RecalculationTask] = []
         active_index = int(storyboard.active_entry_index)
         num_entries = len(entries)
@@ -892,8 +1032,45 @@ class RecalculateTransitionsOperator(StoryboardOperator):
         else:
             condition = constant(False)
 
-        for index in range(len(entries)):
-            if condition(index):
-                tasks.append(RecalculationTask.for_entry_by_index(entries, index))
+        for index, entry in enumerate(entries):
+            purpose = StoryboardEntryPurpose[entry.purpose]
+            is_split = purpose == StoryboardEntryPurpose.SPLIT
+            is_merge = purpose == StoryboardEntryPurpose.MERGE
+            branch_id = int(getattr(entry, "split_id", 0))
+
+            if is_split:
+                split_branches = tuple(
+                    SplitAllocationDescriptor(
+                        branch_id=int(allocation.branch_id),
+                        num_drones=int(allocation.num_drones),
+                    )
+                    for allocation in entry.split_allocations
+                    if int(allocation.branch_id) > 0
+                )
+            else:
+                split_branches = ()
+
+            tasks.append(
+                RecalculationTask(
+                    entry=entry,
+                    entry_index=index,
+                    branch_id=branch_id,
+                    should_recalculate=bool(condition(index)) and not entry.is_locked,
+                    is_split=is_split,
+                    is_merge=is_merge,
+                    split_branches=split_branches,
+                )
+            )
+
+        tasks_by_branch: dict[int, List[RecalculationTask]] = {}
+        for task in tasks:
+            tasks_by_branch.setdefault(task.branch_id, []).append(task)
+
+        for branch_tasks in tasks_by_branch.values():
+            branch_tasks.sort(
+                key=lambda task: (task.entry.frame_start, task.entry.frame_end, task.entry_index)
+            )
+            for previous, current in zip(branch_tasks, branch_tasks[1:]):
+                previous.start_frame_of_next_entry = current.entry.frame_start
 
         return tasks
