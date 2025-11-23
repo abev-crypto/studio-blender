@@ -136,6 +136,12 @@ def _handle_mapping_change(self: StoryboardEntry, context: Optional[Context] = N
     self._invalidate_decoded_mapping()
 
 
+def _handle_recognized_point_mapping_change(
+    self: StoryboardEntry, context: Optional[Context] = None
+):
+    self._invalidate_decoded_recognized_point_mapping()
+
+
 def _get_frame_end(self: StoryboardEntry) -> int:
     return self.frame_start + self.duration - 1
 
@@ -366,13 +372,25 @@ class StoryboardEntry(PropertyGroup):
     mapping = StringProperty(
         name="Mapping",
         description=(
-            "Mapping where the i-th element is the index of the drone that "
-            "marker i was matched to in the storyboard entry, or -1 if the "
-            "marker is unmatched."
+            "Mapping where the i-th element is the index of the marker that "
+            "drone i was matched to in the storyboard entry, or null if the "
+            "drone was not mapped."
         ),
         default="",
         options={"HIDDEN"},
         update=_handle_mapping_change,
+    )
+
+    recognized_point_mapping = StringProperty(
+        name="Mapping by recognized points",
+        description=(
+            "Mapping where the i-th element is the index of the drone that "
+            "was matched to formation point i as recognized in the formation"
+            ". Unmatched points are stored as null."
+        ),
+        default="",
+        options={"HIDDEN"},
+        update=_handle_recognized_point_mapping_change,
     )
 
     #: Sorting key for storyboard entries
@@ -380,6 +398,9 @@ class StoryboardEntry(PropertyGroup):
 
     _decoded_mapping: Optional[Mapping] = None
     """Decoded mapping of the storyboard entry."""
+
+    _decoded_recognized_point_mapping: Optional[Mapping] = None
+    """Decoded mapping by recognized point order of the storyboard entry."""
 
     @property
     def active_schedule_override_entry(self) -> Optional[ScheduleOverride]:
@@ -468,8 +489,12 @@ class StoryboardEntry(PropertyGroup):
         return result
 
     def get_mapping(self) -> Optional[Mapping]:
-        """Returns the mapping of the markers in the storyboard entry to drone
-        indices, or ``None`` if there is no mapping yet.
+        """Returns the mapping of drones to marker indices for this entry.
+
+        The i-th element of the returned list contains the index of the
+        formation point that drone ``i`` was matched to, or ``None`` if the
+        drone is not part of the formation. Returns ``None`` if there is no
+        mapping yet.
         """
         if self._decoded_mapping is None:
             encoded_mapping = self.mapping.strip()
@@ -500,13 +525,13 @@ class StoryboardEntry(PropertyGroup):
         )
 
     def update_mapping(self, mapping: Optional[Mapping]) -> None:
-        """Updates the mapping of the markers in the storyboard entry to drone
-        indices.
+        """Updates the mapping of drones to markers for the storyboard entry.
 
         Arguments:
-            mapping: mapping where the i-th item contains the index of the drone
-                that the i-th marker was mapped to, or -1 if the marker is
-                 unmapped. You can also pass ``None`` to clear the entire mapping.
+            mapping: list where the i-th item contains the index of the marker
+                that the i-th drone was mapped to, or ``None`` if the drone is
+                unmapped. You can also pass ``None`` to clear the entire
+                mapping.
         """
         if mapping is None:
             self.mapping = ""
@@ -516,6 +541,46 @@ class StoryboardEntry(PropertyGroup):
 
     def _invalidate_decoded_mapping(self) -> None:
         self._decoded_mapping = None
+
+    def get_recognized_point_mapping(self) -> Optional[Mapping]:
+        """Returns the mapping of formation points to drone indices for this entry.
+
+        The i-th element of the returned list contains the index of the drone
+        that was mapped to the i-th recognized formation point, or ``None`` if
+        the point is not used. Returns ``None`` if there is no mapping yet.
+        """
+
+        if self._decoded_recognized_point_mapping is None:
+            encoded_mapping = self.recognized_point_mapping.strip()
+            if (
+                not encoded_mapping
+                or len(encoded_mapping) < 2
+                or encoded_mapping[0] != "["
+                or encoded_mapping[-1] != "]"
+            ):
+                return None
+            else:
+                self._decoded_recognized_point_mapping = json.loads(encoded_mapping)
+
+        return self._decoded_recognized_point_mapping
+
+    def update_recognized_point_mapping(self, mapping: Optional[Mapping]) -> None:
+        """Updates the mapping of formation points to drones for the storyboard entry.
+
+        Arguments:
+            mapping: list where the i-th item contains the index of the drone
+                that was mapped to the i-th formation point, or ``None`` if the
+                point is unused. You can also pass ``None`` to clear the mapping.
+        """
+
+        if mapping is None:
+            self.recognized_point_mapping = ""
+        else:
+            self.recognized_point_mapping = json.dumps(mapping)
+        assert self._decoded_recognized_point_mapping is None
+
+    def _invalidate_decoded_recognized_point_mapping(self) -> None:
+        self._decoded_recognized_point_mapping = None
 
 
 class StoryboardEntryOrTransition(PropertyGroup):
